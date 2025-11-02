@@ -2,11 +2,34 @@ import os
 import subprocess
 import tempfile
 import streamlit as st
-import speech_recognition as sr
 from pydub import AudioSegment
-from pydub.silence import split_on_silence
-from moviepy import VideoFileClip
+from pydub.effects import normalize, compress_dynamic_range
+import noisereduce as nr
+import numpy as np
 import re
+from moviepy import VideoFileClip
+
+# Import lazy do Whisper para evitar erros de inicialização
+_whisper_loaded = False
+_whisper_module = None
+
+
+def load_whisper():
+    """Carrega o módulo Whisper de forma lazy"""
+    global _whisper_loaded, _whisper_module
+    if not _whisper_loaded:
+        try:
+            import whisper
+            _whisper_module = whisper
+            _whisper_loaded = True
+        except Exception as e:
+            st.error(
+                f"Erro ao carregar Whisper: {str(e)}\n\n"
+                "Tente reinstalar: pip install --upgrade openai-whisper"
+            )
+            raise
+    return _whisper_module
+
 
 # Configuração da página
 st.set_page_config(
@@ -16,17 +39,31 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Dicionário de idiomas suportados
-IDIOMAS = {
-    "Português (Brasil)": "pt-BR",
-    "Português (Portugal)": "pt-PT",
-    "Inglês (EUA)": "en-US",
-    "Inglês (Reino Unido)": "en-GB",
-    "Espanhol": "es-ES",
-    "Espanhol (México)": "es-MX",
-    "Francês": "fr-FR",
-    "Italiano": "it-IT",
-    "Alemão": "de-DE",
+# Mapeamento de idiomas para Whisper
+IDIOMAS_WHISPER = {
+    "Português (Brasil)": "pt",
+    "Português (Portugal)": "pt",
+    "Inglês (EUA)": "en",
+    "Inglês (Reino Unido)": "en",
+    "Espanhol": "es",
+    "Espanhol (México)": "es",
+    "Francês": "fr",
+    "Italiano": "it",
+    "Alemão": "de",
+    "Japonês": "ja",
+    "Chinês": "zh",
+    "Russo": "ru",
+    "Árabe": "ar",
+    "Hindi": "hi",
+}
+
+# Modelos Whisper disponíveis (do menor/mais rápido ao maior/mais preciso)
+MODELOS_WHISPER = {
+    "tiny (Mais rápido, menor precisão)": "tiny",
+    "base (Balanceado)": "base",
+    "small (Boa precisão)": "small",
+    "medium (Alta precisão)": "medium",
+    "large (Máxima precisão, mais lento)": "large-v3",
 }
 
 
@@ -111,6 +148,85 @@ def baixar_video_instagram(
         return None
 
 
+def processar_audio(
+        audio_path, audio_processado_path,
+        normalizar=True, reduzir_ruido=True,
+        progress_bar=None, status_text=None):
+    """
+    Processa o áudio: normalização e redução de ruído
+    """
+    try:
+        if status_text:
+            status_text.text("Processando e melhorando qualidade do áudio...")
+        if progress_bar:
+            progress_bar.progress(0.5)
+
+        # Carrega o áudio
+        audio = AudioSegment.from_wav(audio_path)
+
+        # Normalização de volume
+        if normalizar:
+            if status_text:
+                status_text.text("Normalizando volume do áudio...")
+            audio = normalize(audio)
+            # Compressão de range dinâmico para melhorar clareza
+            audio = compress_dynamic_range(audio)
+
+        # Redução de ruído
+        if reduzir_ruido:
+            if status_text:
+                status_text.text("Reduzindo ruído do áudio...")
+            try:
+                # Converte para numpy array
+                audio_np = np.array(audio.get_array_of_samples())
+
+                # Aplica redução de ruído estacionário
+                audio_reduzido = nr.reduce_noise(
+                    y=audio_np.astype(np.float32),
+                    sr=audio.frame_rate,
+                    stationary=True
+                )
+
+                # Converte de volta para AudioSegment
+                audio_reduzido_int = (
+                    audio_reduzido * 32767
+                ).astype(np.int16)
+                audio = AudioSegment(
+                    audio_reduzido_int.tobytes(),
+                    frame_rate=audio.frame_rate,
+                    channels=audio.channels,
+                    sample_width=audio.sample_width
+                )
+            except Exception as e:
+                # Se falhar, continua sem redução de ruído
+                st.warning(
+                    f"Não foi possível reduzir ruído automaticamente: {e}. "
+                    "Continuando sem redução de ruído."
+                )
+
+        # Garante mono e 16kHz (otimizado para Whisper)
+        if audio.channels != 1:
+            audio = audio.set_channels(1)
+        if audio.frame_rate != 16000:
+            audio = audio.set_frame_rate(16000)
+
+        # Salva o áudio processado
+        audio.export(audio_processado_path, format="wav")
+
+        if progress_bar:
+            progress_bar.progress(0.6)
+        if status_text:
+            status_text.text("Áudio processado com sucesso!")
+
+        return audio_processado_path if os.path.exists(
+            audio_processado_path
+        ) else None
+
+    except Exception as e:
+        st.error(f"Erro ao processar áudio: {str(e)}")
+        return None
+
+
 def extrair_audio(video_path, audio_path, progress_bar=None, status_text=None):
     """
     Extrai o áudio do vídeo e converte para WAV usando MoviePy
@@ -119,7 +235,7 @@ def extrair_audio(video_path, audio_path, progress_bar=None, status_text=None):
         if status_text:
             status_text.text("Extraindo áudio do vídeo...")
         if progress_bar:
-            progress_bar.progress(0.5)
+            progress_bar.progress(0.45)
 
         # Verifica se o arquivo de vídeo existe
         if not os.path.exists(video_path):
@@ -137,12 +253,6 @@ def extrair_audio(video_path, audio_path, progress_bar=None, status_text=None):
             return None
 
         try:
-            # Extrai o áudio e salva como WAV
-            # Configurações otimizadas para reconhecimento de fala:
-            # - 16kHz sample rate (padrão para reconhecimento)
-            # - Mono channel
-            # - FPS ajustado automaticamente pelo MoviePy
-
             audio = video.audio
 
             if audio is None:
@@ -151,13 +261,12 @@ def extrair_audio(video_path, audio_path, progress_bar=None, status_text=None):
                 return None
 
             # Salva o áudio em formato WAV
-            # Na versão 2.x do moviepy, verbose foi removido
             audio.write_audiofile(
                 audio_path,
-                fps=16000,  # Taxa de amostragem otimizada para reconhecimento
-                nbytes=2,   # 16-bit (2 bytes)
-                codec='pcm_s16le',  # Codec PCM 16-bit little-endian
-                logger=None  # Suprime logs e barra de progresso
+                fps=16000,
+                nbytes=2,
+                codec='pcm_s16le',
+                logger=None
             )
 
             # Fecha os objetos para liberar memória
@@ -165,7 +274,6 @@ def extrair_audio(video_path, audio_path, progress_bar=None, status_text=None):
             video.close()
 
         except Exception as e:
-            # Garante que os recursos são liberados mesmo em caso de erro
             try:
                 if 'audio' in locals():
                     audio.close()
@@ -178,111 +286,108 @@ def extrair_audio(video_path, audio_path, progress_bar=None, status_text=None):
             return None
 
         if progress_bar:
-            progress_bar.progress(0.6)
+            progress_bar.progress(0.5)
         if status_text:
             status_text.text("Áudio extraído com sucesso!")
 
-        # Verifica se o arquivo foi criado corretamente
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-            return audio_path
-        else:
-            st.error("Erro: Arquivo de áudio não foi criado corretamente.")
-            return None
+        return audio_path if os.path.exists(audio_path) else None
 
     except Exception as e:
         st.error(f"Erro inesperado ao extrair áudio: {str(e)}")
         return None
 
 
-def transcrever_audio(
-        audio_path, idioma="pt-BR", progress_bar=None, status_text=None):
+def adicionar_pontuacao(texto):
     """
-    Transcreve o áudio usando Google Speech Recognition
+    Adiciona pontuação básica ao texto transcrito
     """
-    recognizer = sr.Recognizer()
+    if not texto:
+        return texto
 
+    # Remove espaços múltiplos
+    texto = re.sub(r'\s+', ' ', texto).strip()
+
+    # Adiciona ponto após maiúsculas seguidas de ponto e espaço
+    # (para frases que já terminam)
+    texto = re.sub(r'([.!?])\s*([A-ZÁÉÍÓÚÀÈÌÒÙÂÊÎÔÛÃÕÇ])', r'\1 \2', texto)
+
+    # Adiciona ponto final se não terminar com pontuação
+    if texto and texto[-1] not in '.!?':
+        texto += '.'
+
+    # Capitaliza primeira letra
+    if texto:
+        texto = texto[0].upper() + texto[1:]
+
+    # Corrige espaços antes de pontuação
+    texto = re.sub(r'\s+([,.!?;:])', r'\1', texto)
+
+    # Adiciona espaço após pontuação se não houver
+    texto = re.sub(r'([,.!?;:])([^\s])', r'\1 \2', texto)
+
+    return texto
+
+
+def transcrever_audio_whisper(
+        audio_path, idioma="pt", modelo="base",
+        adicionar_pontuacao_opcional=True,
+        progress_bar=None, status_text=None):
+    """
+    Transcreve o áudio usando Whisper (OpenAI)
+    """
     try:
         if status_text:
-            status_text.text("Carregando e processando áudio...")
+            status_text.text(f"Carregando modelo Whisper ({modelo})...")
+        if progress_bar:
+            progress_bar.progress(0.65)
 
-        audio = AudioSegment.from_wav(audio_path)
+        # Carrega o módulo Whisper (lazy loading)
+        whisper = load_whisper()
 
-        # Divide o áudio em chunks baseado no silêncio
+        # Carrega o modelo Whisper
+        modelo_whisper = whisper.load_model(modelo)
+
         if status_text:
-            status_text.text("Dividindo áudio em segmentos...")
+            status_text.text("Transcrevendo áudio com Whisper...")
+        if progress_bar:
+            progress_bar.progress(0.7)
 
-        chunks = split_on_silence(
-            audio,
-            min_silence_len=500,  # Mínimo de 500ms de silêncio
-            silence_thresh=audio.dBFS - 14,
-            keep_silence=500  # Mantém 500ms de silêncio nas bordas
+        # Transcreve o áudio
+        resultado = modelo_whisper.transcribe(
+            audio_path,
+            language=idioma,
+            task="transcribe",
+            fp16=False,  # Usa float32 para compatibilidade
+            verbose=False
         )
 
-        # Se não houver chunks, tenta transcrever o áudio completo
-        if not chunks:
-            chunks = [audio]
-
-        transcricao_completa = []
-        total_chunks = len(chunks)
-
-        if status_text:
-            status_text.text(f"Transcrevendo {total_chunks} segmentos...")
-
-        for i, chunk in enumerate(chunks):
-            # Atualiza progresso
-            if progress_bar:
-                progresso = 0.6 + (0.3 * (i + 1) / total_chunks)
-                progress_bar.progress(progresso)
-
-            # Exporta chunk temporário
-            chunk_path = f"temp_chunk_{i}.wav"
-            try:
-                chunk.export(chunk_path, format="wav")
-
-                # Transcreve o chunk
-                with sr.AudioFile(chunk_path) as source:
-                    # Ajusta para ruído ambiente
-                    recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                    audio_data = recognizer.record(source)
-
-                    try:
-                        texto = recognizer.recognize_google(
-                            audio_data, language=idioma)
-                        transcricao_completa.append(texto)
-                    except sr.UnknownValueError:
-                        # Silenciosamente ignora segmentos não reconhecidos
-                        pass
-                    except sr.RequestError as e:
-                        msg = (
-                            f"Erro na API do Google para segmento "
-                            f"{i+1}: {e}"
-                        )
-                        st.warning(msg)
-            finally:
-                # Remove chunk temporário
-                limpar_arquivos_temporarios(chunk_path)
+        texto_transcrito = resultado["text"].strip()
 
         if progress_bar:
-            progress_bar.progress(0.95)
+            progress_bar.progress(0.9)
 
-        resultado = " ".join(transcricao_completa)
+        # Aplica pós-processamento de pontuação se solicitado
+        if adicionar_pontuacao_opcional and texto_transcrito:
+            if status_text:
+                status_text.text("Aplicando pontuação automática...")
+            texto_transcrito = adicionar_pontuacao(texto_transcrito)
 
         if progress_bar:
             progress_bar.progress(1.0)
         if status_text:
             status_text.text("Transcrição concluída!")
 
-        return resultado if resultado.strip() else None
+        return texto_transcrito if texto_transcrito else None
 
     except Exception as e:
-        st.error(f"Erro ao transcrever áudio: {str(e)}")
+        st.error(f"Erro ao transcrever com Whisper: {str(e)}")
         return None
 
 
 def main():
     # Cabeçalho
     st.title("🎬 Insta to Text")
-    st.markdown("### Transcritor de Vídeos do Instagram")
+    st.markdown("### Transcritor de Vídeos do Instagram com Whisper")
     st.markdown("---")
 
     # Sidebar com informações
@@ -291,27 +396,61 @@ def main():
         st.markdown("""
         **Como usar:**
         1. Cole a URL do vídeo do Instagram
-        2. Selecione o idioma do áudio
+        2. Configure as opções abaixo
         3. Clique em "Transcrever"
         4. Aguarde o processamento
 
-        **Requisitos:**
-        - yt-dlp instalado
-        - Conexão com internet
-        - Bibliotecas Python instaladas (requirements.txt)
+        **Melhorias:**
+        - 🎯 Whisper AI (alta precisão)
+        - 🔊 Normalização automática de áudio
+        - 🔇 Redução de ruído automática
+        - 📝 Pontuação automática opcional
         """)
 
         st.markdown("---")
-        st.header("Configurações")
+        st.header("Configurações de Transcrição")
 
         idioma_selecionado = st.selectbox(
             "Idioma do áudio:",
-            options=list(IDIOMAS.keys()),
+            options=list(IDIOMAS_WHISPER.keys()),
             index=0,
-            help="Selecione o idioma falado no vídeo para melhor precisão"
+            help="Selecione o idioma falado no vídeo"
         )
 
-        idioma_codigo = IDIOMAS[idioma_selecionado]
+        idioma_codigo = IDIOMAS_WHISPER[idioma_selecionado]
+
+        modelo_selecionado = st.selectbox(
+            "Modelo Whisper:",
+            options=list(MODELOS_WHISPER.keys()),
+            index=1,  # base como padrão
+            help="Modelos maiores são mais precisos mas mais lentos"
+        )
+
+        modelo_codigo = MODELOS_WHISPER[modelo_selecionado]
+
+        st.markdown("---")
+        st.header("Processamento de Áudio")
+
+        normalizar_audio = st.checkbox(
+            "Normalizar áudio automaticamente",
+            value=True,
+            help="Ajusta volume e compressão dinâmica"
+        )
+
+        reduzir_ruido = st.checkbox(
+            "Reduzir ruído automaticamente",
+            value=True,
+            help="Remove ruído de fundo do áudio"
+        )
+
+        st.markdown("---")
+        st.header("Pós-processamento")
+
+        adicionar_pontuacao_auto = st.checkbox(
+            "Adicionar pontuação automaticamente",
+            value=True,
+            help="Aplica pontuação e formatação ao texto"
+        )
 
         limpar_automatico = st.checkbox(
             "Limpar arquivos temporários automaticamente",
@@ -353,6 +492,9 @@ def main():
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = os.path.join(temp_dir, "video_instagram.mp4")
             audio_path = os.path.join(temp_dir, "audio.wav")
+            audio_processado_path = os.path.join(
+                temp_dir, "audio_processado.wav"
+            )
 
             # Barra de progresso
             progress_bar = st.progress(0)
@@ -377,14 +519,34 @@ def main():
                     limpar_arquivos_temporarios(video_file)
                     st.stop()
 
-                # Passo 3: Transcrever áudio
-                transcricao = transcrever_audio(
-                    audio_file, idioma_codigo, progress_bar, status_text
+                # Passo 3: Processar áudio (normalização e redução de ruído)
+                audio_processado = processar_audio(
+                    audio_file,
+                    audio_processado_path,
+                    normalizar=normalizar_audio,
+                    reduzir_ruido=reduzir_ruido,
+                    progress_bar=progress_bar,
+                    status_text=status_text
+                )
+                if not audio_processado:
+                    # Usa áudio original se processamento falhar
+                    audio_processado = audio_file
+
+                # Passo 4: Transcrever com Whisper
+                transcricao = transcrever_audio_whisper(
+                    audio_processado,
+                    idioma_codigo,
+                    modelo_codigo,
+                    adicionar_pontuacao_opcional=adicionar_pontuacao_auto,
+                    progress_bar=progress_bar,
+                    status_text=status_text
                 )
 
                 # Limpeza automática se solicitado
                 if limpar_automatico:
-                    limpar_arquivos_temporarios(video_file, audio_file)
+                    limpar_arquivos_temporarios(
+                        video_file, audio_file, audio_processado_path
+                    )
 
                 # Exibe resultado
                 with resultado_container:
@@ -412,21 +574,26 @@ def main():
                         )
 
                         # Estatísticas
-                        col_stat1, col_stat2, col_stat3 = st.columns(3)
+                        col_stat1, col_stat2, col_stat3, col_stat4 = (
+                            st.columns(4)
+                        )
                         with col_stat1:
                             st.metric("Palavras", len(transcricao.split()))
                         with col_stat2:
                             st.metric("Caracteres", len(transcricao))
                         with col_stat3:
                             st.metric("Idioma", idioma_selecionado)
+                        with col_stat4:
+                            modelo_nome = modelo_selecionado.split()[0]
+                            st.metric("Modelo", modelo_nome)
                     else:
                         st.error("Não foi possível gerar a transcrição.")
                         st.info(
                             "Dicas:\n"
                             "- Verifique se o vídeo tem áudio\n"
                             "- Tente selecionar outro idioma\n"
-                            "- Verifique sua conexão com a internet\n"
-                            "- Alguns vídeos podem estar com áudio muito baixo"
+                            "- Experimente um modelo maior (small/medium)\n"
+                            "- Verifique se há espaço em disco suficiente"
                         )
 
             except Exception as e:
@@ -440,7 +607,7 @@ def main():
     st.markdown("---")
     st.caption(
         "Desenvolvido com Streamlit por Felipe Toledo | "
-        "Powered by Google Speech Recognition API"
+        "Powered by OpenAI Whisper AI"
     )
 
 
