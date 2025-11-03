@@ -1,3 +1,4 @@
+from app import download_instagram_video, transcribe_with_whisper_local
 import io
 import os
 import types
@@ -35,14 +36,14 @@ def test_transcribe_route_happy_path(monkeypatch, tmp_path):
     video_path = tmp_path / "video.mp4"
     video_path.write_bytes(b"fake mp4 data")
 
-from app import download_instagram_video, transcribe_with_whisper_local
 
-    def fake_download(url: str):
-        return str(video_path), "video.mp4"
+def fake_download(url: str):
+    return str(video_path), "video.mp4"
 
-    def fake_transcribe(path: str):
-        assert os.path.exists(path)
-        return "hello world"
+
+def fake_transcribe(path: str):
+    assert os.path.exists(path)
+    return "hello world"
 
     monkeypatch.setattr("app.download_instagram_video", fake_download)
     monkeypatch.setattr("app.transcribe_with_whisper_local", fake_transcribe)
