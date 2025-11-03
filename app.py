@@ -23,10 +23,10 @@ ALLOWED_HOSTS = {
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    # Use a stable default SECRET_KEY if none provided (avoids session errors)
+
     app.config["SECRET_KEY"] = os.environ.get(
         "FLASK_SECRET_KEY", "dev-secret-change-me")
-    app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB safety
+    app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB
 
     @app.route("/", methods=["GET"])
     def index():
@@ -41,7 +41,7 @@ def create_app() -> Flask:
             flash(str(exc), "error")
             return redirect(url_for("index"))
 
-        # Download video as MP4 without local ffmpeg postprocessing
+        # Download video como MP4 sem local ffmpeg pós processamento
         try:
             file_path, filename = download_instagram_video(input_url)
         except Exception as exc:  # noqa: BLE001
@@ -54,7 +54,6 @@ def create_app() -> Flask:
             flash(f"Falha na transcrição: {exc}", "error")
             transcript_text = None
         finally:
-            # Always cleanup downloaded file
             try:
                 os.remove(file_path)
             except OSError:
@@ -68,7 +67,7 @@ def create_app() -> Flask:
 def validate_instagram_url_or_raise(url: str) -> None:
     if not url:
         raise ValueError("Informe uma URL do Instagram.")
-    # Basic structure and host allowlist (mitigate SSRF)
+
     pattern = re.compile(r"^https?://([^/]+)(/.*)?$", re.IGNORECASE)
     match = pattern.match(url)
     if not match:
@@ -76,7 +75,7 @@ def validate_instagram_url_or_raise(url: str) -> None:
     host = match.group(1).lower()
     if host not in ALLOWED_HOSTS:
         raise ValueError("A URL deve ser do domínio instagram.com.")
-    # Optional: restrict to common Instagram paths
+
     if not re.search(r"/(reel|reels|p|tv)/", url, flags=re.IGNORECASE):
         raise ValueError(
             "Forneça a URL de um post, reel ou vídeo do Instagram.")
@@ -93,7 +92,6 @@ def temp_download_dir() -> Tuple[str, str]:
         try:
             os.rmdir(session_dir)
         except OSError:
-            # Directory may not be empty if removal failed earlier; ignore
             pass
 
 
@@ -103,11 +101,9 @@ def download_instagram_video(url: str) -> Tuple[str, str]:
     Returns (file_path, filename).
     """
     with temp_download_dir() as (session_dir, _):
-        # Choose a format that results in a single container file without postproc
-        # Prefer MP4 if available; fall back to best single file
         format_selector = "best[ext=mp4]/best"
         unique = uuid.uuid4().hex
-        # Use a safe template; yt-dlp will append extension
+
         outtmpl = os.path.join(session_dir, f"%(title).80s-{unique}.%(ext)s")
         ydl_opts = {
             "outtmpl": outtmpl,
@@ -117,18 +113,17 @@ def download_instagram_video(url: str) -> Tuple[str, str]:
             "quiet": True,
             "no_warnings": True,
             "retries": 2,
-            "ratelimit": 5_000_000,  # ~5MB/s to be gentle
+            "ratelimit": 5_000_000,  # ~5MB/s
             "trim_filenames": 120,
-            "max_filesize": 200 * 1024 * 1024,  # 200 MB max
+            "max_filesize": 200 * 1024 * 1024,  # 200 MB
         }
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # Compute resulting path
+
             ext = info.get("ext") or "mp4"
             title = info.get("title") or f"instagram-{unique}"
             safe_name = secure_filename(f"{title}-{unique}.{ext}")
-            # yt-dlp used template already; search for the downloaded file in dir
-            # If multiple files match, pick the largest
+
             candidates = [
                 os.path.join(session_dir, f)
                 for f in os.listdir(session_dir)
@@ -163,10 +158,8 @@ def extract_wav_with_bundled_ffmpeg(input_video_path: str) -> str:
 
 
 def transcribe_with_whisper_local(file_path: str) -> str:
-    # Convert input MP4 to WAV using bundled ffmpeg to ensure decoding works without system ffmpeg
     wav_path = extract_wav_with_bundled_ffmpeg(file_path)
     try:
-        # Use a small model for speed; change to "base"/"small" as desired
         model_size = os.environ.get("WHISPER_MODEL", "small")
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
         segments, info = model.transcribe(wav_path, beam_size=1, language=None)
