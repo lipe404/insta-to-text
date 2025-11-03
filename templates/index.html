@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Insta to Text</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='styles.css') }}"
+    />
+  </head>
+  <body>
+    <div class="background"></div>
+    <main class="glass-card">
+      <h1>Insta → Text</h1>
+      <p class="subtitle">
+        Cole a URL de um Reel/Post do Instagram e obtenha a transcrição.
+      </p>
+
+      {% with messages = get_flashed_messages(with_categories=true) %} {% if
+      messages %}
+      <div class="alerts">
+        {% for category, message in messages %}
+        <div class="alert {{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+      {% endif %} {% endwith %}
+
+      <form
+        class="input-form"
+        action="{{ url_for('transcribe') }}"
+        method="POST"
+        novalidate
+      >
+        <label for="instagram_url">URL do Instagram</label>
+        <input
+          type="url"
+          id="instagram_url"
+          name="instagram_url"
+          placeholder="https://www.instagram.com/reel/XXXXXXXXX/"
+          required
+          pattern="https?://(www\.)?instagram\.com/.*"
+        />
+        <button type="submit">Transcrever</button>
+      </form>
+
+      {% if transcript %}
+      <section class="result">
+        <h2>Transcrição</h2>
+        <pre class="transcript">{{ transcript }}</pre>
+      </section>
+      {% endif %}
+
+      <footer>
+        <small
+          >Respeite os termos de uso do Instagram e do serviço de transcrição
+          utilizado.</small
+        >
+      </footer>
+    </main>
+  </body>
+</html>
