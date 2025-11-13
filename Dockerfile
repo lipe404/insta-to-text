@@ -1,31 +1,26 @@
-# Imagem base leve com Python e ffmpeg
 FROM python:3.10-slim
 
-# Instalar dependências do sistema
+# Instalar apenas dependências essenciais
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    libavformat-dev \
-    libavcodec-dev \
-    libavdevice-dev \
-    libavutil-dev \
-    libavfilter-dev \
-    libswscale-dev \
-    libswresample-dev \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# Criar diretório da aplicação
 WORKDIR /app
 
-# Copiar os arquivos de dependência e instalar libs Python
+# Instalar dependências Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar o restante do código
+# Copiar código
 COPY . .
 
-# Expor a porta (Render define automaticamente, mas é bom manter)
+# Variáveis de ambiente para otimização
+ENV FLASK_ENV=production
+ENV WHISPER_MODEL=tiny
+ENV PYTHONUNBUFFERED=1
+
 EXPOSE 8000
 
-# Comando de inicialização
-CMD ["gunicorn", "app:create_app()"]
+# Gunicorn com configurações leves
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "2", "--timeout", "120", "--max-requests", "100", "--max-requests-jitter", "10", "app:create_app()"]

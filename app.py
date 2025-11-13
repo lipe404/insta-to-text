@@ -20,13 +20,17 @@ ALLOWED_HOSTS = {
     "cdninstagram.com",
 }
 
+# Limites de recursos para ambiente de produção
+MAX_VIDEO_DURATION = 180  # 3 minutos
+MAX_VIDEO_SIZE_MB = 50  # Reduzido de 200MB para 50MB
+
 
 def create_app() -> Flask:
     app = Flask(__name__)
 
     app.config["SECRET_KEY"] = os.environ.get(
         "FLASK_SECRET_KEY", "dev-secret-change-me")
-    app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB
+    app.config["MAX_CONTENT_LENGTH"] = MAX_VIDEO_SIZE_MB * 1024 * 1024
 
     @app.route("/", methods=["GET"])
     def index():
@@ -35,31 +39,51 @@ def create_app() -> Flask:
     @app.route("/transcribe", methods=["POST"])
     def transcribe():
         input_url = (request.form.get("instagram_url") or "").strip()
+
+        if not input_url:
+            flash("Informe uma URL do Instagram.", "error")
+            return redirect(url_for("index"))
+
         try:
             validate_instagram_url_or_raise(input_url)
         except ValueError as exc:
             flash(str(exc), "error")
             return redirect(url_for("index"))
 
-        # Download video como MP4 sem local ffmpeg pós processamento
+        file_path = None
+        wav_path = None
+
         try:
-            file_path, filename = download_instagram_video(input_url)
-        except Exception as exc:  # noqa: BLE001
-            flash(f"Falha ao baixar o vídeo: {exc}", "error")
+            file_path = download_instagram_audio_only(input_url)
+
+            # Validar duração do vídeo
+            duration = get_audio_duration(file_path)
+            if duration > MAX_VIDEO_DURATION:
+                raise ValueError(
+                    f"Vídeo muito longo ({int(duration)}s). Máximo: {MAX_VIDEO_DURATION}s"
+                )
+
+            # Transcrever
+            transcript_text = transcribe_with_whisper_local(file_path)
+
+            flash("Transcrição concluída com sucesso!", "success")
+            return render_template("index.html", transcript=transcript_text, error=None)
+
+        except Exception as exc:
+            error_msg = str(exc)
+
+            if "rate-limit" in error_msg.lower() or "login required" in error_msg.lower():
+                error_msg = (
+                    "Instagram bloqueou a requisição. "
+                    "Tente novamente em alguns minutos ou use uma URL diferente."
+                )
+
+            flash(f"Erro: {error_msg}", "error")
             return redirect(url_for("index"))
 
-        try:
-            transcript_text = transcribe_with_whisper_local(file_path)
-        except Exception as exc:  # noqa: BLE001
-            flash(f"Falha na transcrição: {exc}", "error")
-            transcript_text = None
         finally:
-            try:
-                os.remove(file_path)
-            except OSError:
-                pass
-
-        return render_template("index.html", transcript=transcript_text, error=None)
+            # Limpeza garantida de arquivos temporários
+            cleanup_files([file_path, wav_path])
 
     return app
 
@@ -72,109 +96,201 @@ def validate_instagram_url_or_raise(url: str) -> None:
     match = pattern.match(url)
     if not match:
         raise ValueError("URL inválida.")
+
     host = match.group(1).lower()
     if host not in ALLOWED_HOSTS:
         raise ValueError("A URL deve ser do domínio instagram.com.")
 
-    if not re.search(r"/(reel|reels|p|tv)/", url, flags=re.IGNORECASE):
         raise ValueError(
-            "Forneça a URL de um post, reel ou vídeo do Instagram.")
+            "Forneça a URL de um post, reel ou vídeo do Instagram."
+        )
 
 
-@contextmanager
-def temp_download_dir() -> Tuple[str, str]:
-    base_tmp = tempfile.gettempdir()
-    session_dir = os.path.join(base_tmp, f"insta_to_text_{uuid.uuid4().hex}")
-    os.makedirs(session_dir, exist_ok=True)
-    try:
-        yield session_dir, base_tmp
-    finally:
-        try:
-            os.rmdir(session_dir)
-        except OSError:
-            pass
-
-
-def download_instagram_video(url: str) -> Tuple[str, str]:
-    """Download Instagram media as a single MP4 file using yt-dlp.
-
-    Returns (file_path, filename).
+def download_instagram_audio_only(url: str) -> str:
     """
-    with temp_download_dir() as (session_dir, _):
-        format_selector = "best[ext=mp4]/best"
-        unique = uuid.uuid4().hex
+    Download apenas o áudio do Instagram.
+    Implementa estratégias contra rate-limit.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="insta_audio_")
+    unique = uuid.uuid4().hex[:8]
 
-        outtmpl = os.path.join(session_dir, f"%(title).80s-{unique}.%(ext)s")
-        ydl_opts = {
-            "outtmpl": outtmpl,
-            "format": format_selector,
-            "restrictfilenames": True,
-            "nocheckcertificate": True,
-            "quiet": True,
-            "no_warnings": True,
-            "retries": 2,
-            "ratelimit": 5_000_000,  # ~5MB/s
-            "trim_filenames": 120,
-            "max_filesize": 200 * 1024 * 1024,  # 200 MB
-        }
+    output_path = os.path.join(temp_dir, f"audio_{unique}.m4a")
+
+    ydl_opts = {
+        "outtmpl": output_path,
+        "format": "bestaudio/best",  # Apenas áudio
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+
+        # ANTI-RATE-LIMIT: User-Agent moderno
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
+            "Referer": "https://www.instagram.com/",
+        },
+
+        # Cookies (se disponível no ambiente)
+        "cookiesfrombrowser": None,  # Desabilitado por padrão
+
+        # Limites
+        "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
+        "ratelimit": 3_000_000,  # 3MB/s (mais conservador)
+
+        # Extrair sem pós-processamento
+        "postprocessors": [],
+        "extract_flat": False,
+    }
+
+    # Se tiver cookies em variável de ambiente (solução pro rate-limit)
+    cookies_path = os.environ.get("INSTAGRAM_COOKIES_PATH")
+    if cookies_path and os.path.exists(cookies_path):
+        ydl_opts["cookiefile"] = cookies_path
+
+    try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-            ext = info.get("ext") or "mp4"
-            title = info.get("title") or f"instagram-{unique}"
-            safe_name = secure_filename(f"{title}-{unique}.{ext}")
+            # Buscar arquivo baixado
+            downloaded_file = find_downloaded_file(temp_dir)
+            if not downloaded_file:
+                raise RuntimeError("Arquivo não foi baixado corretamente.")
 
-            candidates = [
-                os.path.join(session_dir, f)
-                for f in os.listdir(session_dir)
-                if f.endswith(f".{ext}")
-            ]
-            if not candidates:
-                raise RuntimeError(
-                    "Não foi possível localizar o arquivo baixado.")
-            candidates.sort(key=lambda p: os.path.getsize(p), reverse=True)
-            file_path = candidates[0]
-            return file_path, safe_name
+            return downloaded_file
+
+    except Exception as e:
+        # Limpar diretório temporário em caso de erro
+        cleanup_files([temp_dir])
+        raise
 
 
-def extract_wav_with_bundled_ffmpeg(input_video_path: str) -> str:
-    """Extract 16kHz mono WAV using a bundled static ffmpeg binary (no system install)."""
+def find_downloaded_file(directory: str) -> Optional[str]:
+    """Localiza o arquivo de áudio baixado."""
+    for filename in os.listdir(directory):
+        if filename.endswith(('.m4a', '.mp3', '.opus', '.webm', '.mp4')):
+            return os.path.join(directory, filename)
+    return None
+
+
+def get_audio_duration(file_path: str) -> float:
+    """Obtém duração do áudio em segundos usando ffprobe."""
+    ffprobe = imageio_ffmpeg.get_ffmpeg_exe().replace('ffmpeg', 'ffprobe')
+
+    cmd = [
+        ffprobe,
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file_path
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def extract_wav_with_bundled_ffmpeg(input_file_path: str) -> str:
+    """Extrai WAV 16kHz mono usando ffmpeg empacotado."""
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    wav_path = os.path.splitext(input_video_path)[0] + "_audio.wav"
+    wav_path = os.path.splitext(input_file_path)[0] + "_audio.wav"
+
     cmd = [
         ffmpeg_exe,
         "-y",
-        "-i", input_video_path,
-        "-vn",
-        "-ac", "1",
-        "-ar", "16000",
+        "-i", input_file_path,
+        "-vn",  # Sem vídeo
+        "-ac", "1",  # Mono
+        "-ar", "16000",  # 16kHz
         "-f", "wav",
         wav_path,
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60  # Timeout de 1 minuto
+    )
+
     if proc.returncode != 0 or not os.path.exists(wav_path):
-        raise RuntimeError("Falha ao extrair áudio com ffmpeg empacotado.")
+        raise RuntimeError(f"Falha ao extrair áudio: {proc.stderr.decode()}")
+
     return wav_path
 
 
 def transcribe_with_whisper_local(file_path: str) -> str:
-    wav_path = extract_wav_with_bundled_ffmpeg(file_path)
+    """
+    Transcreve áudio usando Whisper otimizado para produção.
+    """
+    wav_path = None
+
     try:
-        model_size = os.environ.get("WHISPER_MODEL", "small")
-        model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        segments, info = model.transcribe(wav_path, beam_size=1, language=None)
-        text_parts = []
-        for seg in segments:
-            text_parts.append(seg.text)
-        return " ".join(part.strip() for part in text_parts if part.strip())
+        # Extrair WAV
+        wav_path = extract_wav_with_bundled_ffmpeg(file_path)
+
+        # OTIMIZAÇÃO: Usar modelo menor em produção
+        is_production = os.environ.get("FLASK_ENV") == "production"
+        model_size = "tiny" if is_production else os.environ.get(
+            "WHISPER_MODEL", "base")
+
+        # Carregar modelo com configurações leves
+        model = WhisperModel(
+            model_size,
+            device="cpu",
+            compute_type="int8",  # Quantização para economia de memória
+            num_workers=1,  # Reduzir threads
+        )
+
+        # Transcrever com beam_size mínimo
+        segments, info = model.transcribe(
+            wav_path,
+            beam_size=1,  # Mínimo para velocidade
+            language="pt",  # Forçar português (economiza detecção)
+            vad_filter=True,  # Filtrar silêncios
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
+
+        # Coletar texto
+        text_parts = [seg.text.strip() for seg in segments if seg.text.strip()]
+
+        return " ".join(text_parts) if text_parts else "Nenhuma fala detectada."
+
     finally:
+        cleanup_files([wav_path])
+
+
+def cleanup_files(paths: list) -> None:
+    """Remove arquivos/diretórios temporários com segurança."""
+    for path in paths:
+        if not path or not isinstance(path, str):
+            continue
+
         try:
-            os.remove(wav_path)
+            if os.path.isfile(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                import shutil
+                shutil.rmtree(path, ignore_errors=True)
         except OSError:
             pass
 
 
 if __name__ == "__main__":
     app = create_app()
-    app.run(host="0.0.0.0", port=int(
-        os.environ.get("PORT", "8000")), debug=True)
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
