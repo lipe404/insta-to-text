@@ -53,7 +53,11 @@
       {% if transcript %}
       <section class="result">
         <h2>Transcrição</h2>
-        <pre class="transcript">{{ transcript }}</pre>
+        <div class="result-actions" style="display: flex; justify-content: flex-end; gap: 8px; margin-bottom: 8px;">
+          <button type="button" id="copy-btn">Copiar texto</button>
+          <span id="copy-status" aria-live="polite" style="font-size: 0.9em; color: #2e7d32; display: none;">Copiado!</span>
+        </div>
+        <pre class="transcript" id="transcript-text">{{ transcript }}</pre>
       </section>
       {% endif %}
 
@@ -64,5 +68,53 @@
         >
       </footer>
     </main>
+    <script>
+      (function () {
+        var btn = document.getElementById('copy-btn');
+        if (!btn) return;
+        var statusEl = document.getElementById('copy-status');
+        var pre = document.getElementById('transcript-text');
+
+        function showStatus(msg) {
+          if (!statusEl) return;
+          statusEl.textContent = msg;
+          statusEl.style.display = 'inline';
+          setTimeout(function () {
+            statusEl.style.display = 'none';
+          }, 1500);
+        }
+
+        btn.addEventListener('click', function () {
+          if (!pre) return;
+          var text = pre.textContent || '';
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () {
+              showStatus('Copiado!');
+            }).catch(function () {
+              fallbackCopy(text);
+            });
+          } else {
+            fallbackCopy(text);
+          }
+        });
+
+        function fallbackCopy(text) {
+          var textarea = document.createElement('textarea');
+          textarea.value = text;
+          textarea.style.position = 'fixed';
+          textarea.style.top = '-9999px';
+          document.body.appendChild(textarea);
+          textarea.focus();
+          textarea.select();
+          try {
+            var ok = document.execCommand('copy');
+            showStatus(ok ? 'Copiado!' : 'Falhou');
+          } catch (e) {
+            showStatus('Falhou');
+          }
+          document.body.removeChild(textarea);
+        }
+      })();
+    </script>
   </body>
 </html>
